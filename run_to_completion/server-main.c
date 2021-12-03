@@ -23,10 +23,10 @@
 
 static volatile bool force_quit;
 
-#define RX_RING_SIZE 1024
-#define TX_RING_SIZE 1024
+#define RX_RING_SIZE 4096
+#define TX_RING_SIZE 4096
 
-#define NUM_MBUFS 8191
+#define NUM_MBUFS 32767
 #define MBUF_CACHE_SIZE 250
 #define BURST_SIZE 32
 
@@ -39,7 +39,7 @@ static const struct rte_eth_conf port_conf_default = {
 	.rx_adv_conf = {
 		.rss_conf = {
 			.rss_key = NULL,
-			.rss_hf = ETH_RSS_IP | ETH_RSS_TCP | ETH_RSS_UDP,
+			.rss_hf = ETH_RSS_NONFRAG_IPV4_UDP,
 		},
 	},
 };
