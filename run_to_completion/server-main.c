@@ -17,6 +17,7 @@
 #include <rte_udp.h>
 #include <stdbool.h>
 #include <inttypes.h>
+#include <signal.h>
 
 #include "SimpleDNS.h"
 
@@ -33,7 +34,7 @@ static volatile bool force_quit;
 
 static const struct rte_eth_conf port_conf_default = {
 	.rxmode = {
-		rx_mode.mq_mode = ETH_MQ_RX_RSS,
+		.mq_mode = ETH_MQ_RX_RSS,
 	},
 	.rx_adv_conf = {
 		.rss_conf = {
@@ -348,6 +349,7 @@ signal_handler(int signum)
 int
 main(int argc, char *argv[])
 {
+	unsigned lcore_id;
 	uint16_t portid = 0, nb_ports = 1;
 
 	/* Initialize the Environment Abstraction Layer (EAL). */
@@ -375,9 +377,6 @@ main(int argc, char *argv[])
 
 	if (rte_lcore_count() > 1)
 		printf("\nWARNING: Too many lcores enabled. Only 1 used.\n");
-
-	/* Call lcore_main on the master core only. */
-	lcore_main();
 
     ret = 0;
 	/* launch per-lcore init on every lcore */

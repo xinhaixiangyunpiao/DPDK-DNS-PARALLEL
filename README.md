@@ -144,7 +144,7 @@ l2fwd_launch_one_lcore(__attribute__((unused)) void *dummy)
 ``` C
 struct rte_eth_conf port_conf = {
 	.rxmode = {
-		rx_mode.mq_mode = ETH_MQ_RX_RSS,
+		.mq_mode = ETH_MQ_RX_RSS,
 	},
 	.rx_adv_conf = {
 		.rss_conf = {
