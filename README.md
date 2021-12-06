@@ -165,14 +165,42 @@ struct rte_eth_conf port_conf = {
 ## 具体实现
 1. 划分阶段
 *ps: 参考代码：**distributor***
-- 这里没有进行详细的Profile，仅按照功能进行简单的划分，划分了七个线程，每个线程分配给一个lcore：
-    1. 1个rx线程：利用rte_eth_rx_burst函数接收包到mbuf中。
-    2. 1个分发线程：负责把任务按照接收的包个数均匀分发到处理线程上。
-    2. 4个处理线程：对接收到的数据包进行处理并填充好发送的mbuf。
-    3. 1个tx线程：利用rte_eth_rx_burst函数进行发包。
+``` C
+    dist_tx_ring = rte_ring_create("Output_ring", SCHED_TX_RING_SZ,
+			rte_socket_id(), RING_F_SC_DEQ | RING_F_SP_ENQ);
+	if (dist_tx_ring == NULL)
+		rte_exit(EXIT_FAILURE, "Cannot create output ring\n");
+
+	rx_dist_ring = rte_ring_create("Input_ring", SCHED_RX_RING_SZ,
+			rte_socket_id(), RING_F_SC_DEQ | RING_F_SP_ENQ);
+	if (rx_dist_ring == NULL)
+		rte_exit(EXIT_FAILURE, "Cannot create output ring\n");
+```
+> 使用rte_ring_create创建了两个无锁环形队列rx_dist_ring和dist_tx_ring，用于不同阶段线程之间的数据传输。
+``` C
+    uint16_t nb_ret = nb_rx;
+    struct rte_ring *out_ring = p->rx_dist_ring;
+    uint16_t sent = rte_ring_enqueue_burst(out_ring,
+				(void *)bufs, nb_ret, NULL);
+```
+> rte_ring_enqueue_burst将收到的数据包进行批量入队，进入到队列rx_dist_ring中。
+``` C
+    const uint16_t nb_rx = rte_ring_dequeue_burst(in_r,
+				(void *)bufs, BURST_SIZE, NULL);
+```
+> rte_ring_dequeue_burst将队列中的数据按照BURST_SIZE批量出队，实际出队数量为nb_rx。
+
+![pipeline结构图](https://github.com/xinhaixiangyunpiao/MarkDown_Image_Repository/blob/master/3.png?raw=true)
+- 这里没有进行详细的Profile，仅按照功能进行简单的划分，划分了六个线程，每个线程分配给一个lcore：
+    1. 1个rx线程：
+        - 从port批量接收数据，将接收到的数据包批量入队到rx_ring中。
+    2. 4个处理线程：
+        - 每个处理线程从rx_ring取出数据包，每个worker一次都会取n个，处理完了将结果放在tx_ring中。
+    3. 1个tx线程：
+        - 从tx_ring批量取出数据包，并批量发送出去。
 - 线程同步：线程之间通过lcore_params传递无锁队列，利用无锁队列传递数据，具体参考代码。
-- 最终的实现效果为：三个线程流水线运行（接收线程，处理线程，发送线程），四个处理线程并行执行。应当注意，接收线程如果接收的过快，处理的过慢，应当多开一组接收线程或者进行限速处理。另外值得注意的是，可以通过多开某个功能线程的数量实现负载均衡，具体需要自己去调节。
-- 这里认为任务瓶颈在DPDK-DNS数据包处理，所以安排了1个接收线程，1个任务分发线程，1个发送线程，4个处理线程，不同的线程数量比例可能会造成瓶颈转移，需要在实践中进行调试。
+- 最终的实现效果为：三个线程并行运行（接收线程，处理线程，发送线程）。
+- 这里认为任务瓶颈在DPDK-DNS数据包处理，所以安排了1个接收线程，1个发送线程，4个处理线程，不同的线程数量比例可能会造成瓶颈转移，需要在实践中进行调试。
 
 # 关于测试方式和评价标准
 - 测试方式：使用pktgen在node6上进行发包，一次发送n个包，在node5运行DPDK-DNS-PARALLEL程序进行处理，多次实验后输出平均处理结果。

@@ -31,7 +31,8 @@ static volatile bool force_quit;
 
 #define NUM_MBUFS 8191
 #define MBUF_CACHE_SIZE 250
-#define BURST_SIZE 32
+#define BURST_SIZE 64
+#define PROCESS_SIZE 4
 
 static const struct rte_eth_conf port_conf_default = {
 	.rxmode = {
@@ -187,23 +188,21 @@ build_packet(char *buf1, char * buf2, uint16_t pkt_size)
 	udp_hdr2->dgram_cksum = 0;
 }
 
-
-/*
- * The lcore main. This is the main thread that does the work, read
- * an query packet and write an reply packet.
- */
 static void
-lcore_main_loop(void)
+signal_handler(int signum)
 {
-	uint16_t port = 0;	        // only one port is used.
-    unsigned lcore_id;
-	struct rte_mbuf *query_buf[BURST_SIZE], *reply_buf[BURST_SIZE];
-	uint16_t nb_rx, nb_tx;
-	uint8_t *buffer;
-	struct Message msg;
-	memset(&msg, 0, sizeof(struct Message));
-	
-    lcore_id = rte_lcore_id(); // get lcore id 
+	if (signum == SIGINT || signum == SIGTERM) {
+		printf("\n\nSignal %d received, preparing to exit...\n",
+				signum);
+		force_quit = true;
+	}
+}
+
+static int
+lcore_rx((struct rte_ring *rx_ring)
+{
+	uint16_t port;
+	struct rte_mbuf *bufs[BURST_SIZE];
 
 	/*
 	 * Check that the port is on the same NUMA node as the polling thread
@@ -215,37 +214,59 @@ lcore_main_loop(void)
 		printf("WARNING, port %u is on remote NUMA node to "
 				"polling thread.\n\tPerformance will "
 				"not be optimal.\n", port);
-	
-	printf("\nSimpleDNS (using DPDK) is running...\n");
 
-    int total_rx = 0;
-    int total_tx = 0;
-	/* Run until the application is quit or killed. */
+	printf("\nCore %u doing packet RX.\n", rte_lcore_id());
+
+	port = 0;
+	uint32_t rx_queue_drop_packets = 0;
+	while (!force_quit){
+		// 从port接收包
+		uint16_t nb_rx = rte_eth_rx_burst(port, 0, bufs, BURST_SIZE);
+
+		// 批量enqueue到rx_ring中
+		uint16_t sent = rte_ring_enqueue_burst(rx_ring, (void *)bufs, nb_rx, NULL);
+
+		// 释放没入队的包
+		if(unlikely(sent < nb_rx)){
+			rx_queue_drop_packets += nb_rx - sent;
+			while(sent < nb_rx){
+				rte_pktmbuf_free(bufs[sent++]);
+			}
+		}
+	}
+	printf("rx queue drop packet number: %d\n", rx_queue_drop_packets);
+
+	return 0;
+}
+
+static int
+lcore_worker(struct lcore_params *p)
+{
+	uint16_t nb_rx, nb_tx;
+	struct rte_mbuf *query_buf[PROCESS_SIZE], *reply_buf[PROCESS_SIZE];
+	struct rte_ring* rx_ring = p->rx_ring;
+	struct rte_ring* tx_ring = p->tx_ring;
+	struct rte_mempool *mbuf_pool = p->mbuf_pool;
+
+	printf("\nCore %u doing packet processing.\n", rte_lcore_id());
+
 	while (!force_quit) {
-		// Add your code here.
-		// Part 0. 
-
-		// ask for reply packet memory
-		for(int i = 0; i < BURST_SIZE; i++){
+		// apply reply packet memory
+		for(int i = 0; i < PROCESS_SIZE; i++){
 			do{
 				reply_buf[i] = rte_pktmbuf_alloc(mbuf_pool);
 			}while(reply_buf[i] == NULL);
 		}
-		
-		/*********preparation (begin)**********/
-		/*********preparation (end)**********/
-		
-		// Add your code here.
-		// Part 1.
-		// receive to query_buf and assign value to buffer. 0号核接收0号队列，1号核接收1号队列...
-		nb_rx = rte_eth_rx_burst(port, lcore_id, query_buf, BURST_SIZE);
+
+		// dequeue 4 packet
+		nb_rx = rte_ring_dequeue_burst(rx_ring, (void *)query_buf, PROCESS_SIZE, NULL);
 
 		if (unlikely(nb_rx == 0)){
-			for(int i = 0; i < BURST_SIZE; i++)
+			for(int i = 0; i < PROCESS_SIZE; i++)
 				rte_pktmbuf_free(reply_buf[i]);
 			continue;
 		}
-		
+
 		int cnt = 0;
 		for(int i = 0; i < nb_rx; i++){
 
@@ -257,6 +278,7 @@ lcore_main_loop(void)
 
 			// filter the port 9000 not 9000
 			if(*rte_pktmbuf_mtod_offset(query_buf[i], uint16_t*, 36) != rte_cpu_to_be_16(9000)){
+				rte_pktmbuf_free(query_buf[i]);
 				continue;
 			}
 
@@ -266,6 +288,7 @@ lcore_main_loop(void)
 			/*********read input (begin)**********/ 
 			// not DNS
 			if (decode_msg(&msg, buffer, query_buf[i]->data_len - 42) != 0) {
+				rte_pktmbuf_free(query_buf[i]);
 				continue;
 			}
 			/* Print query */
@@ -288,6 +311,7 @@ lcore_main_loop(void)
 			/*********write output (begin)**********/
 			uint8_t *p = buffer;
 			if (encode_msg(&msg, &p) != 0) {
+				rte_pktmbuf_free(query_buf[i]);
 				continue;
 			}
 
@@ -305,217 +329,21 @@ lcore_main_loop(void)
 			build_packet(rte_pktmbuf_mtod_offset(query_buf[i], char*, 0), rte_pktmbuf_mtod_offset(reply_buf[cnt], char*, 0), buflen);
 			cnt++;
 		}
-		
-        // send packet. 0号核发送到0号queue，1号核发送到1号queue
-		nb_tx = rte_eth_tx_burst(port, lcore_id, reply_buf, cnt);
-	   
-        total_rx += nb_rx;
-        total_tx += nb_tx;
-        
-		// free query buffer and unsend packet.
-		for(int i = 0; i < nb_rx; i++){
-			rte_pktmbuf_free(query_buf[i]);
-			if(nb_tx < nb_rx){
-				for(uint8_t j = nb_tx; j < nb_rx; j++)
-				rte_pktmbuf_free(reply_buf[j]);
-			}
-		}
-	}
-    
-    // printf result
-    printf("core id: %d nb_rx:%d, nb_tx:%d\n", lcore_id, total_rx, total_tx); 
-}
-
-static int
-dns_launch_one_lcore(__attribute__((unused)) void *dummy)
-{
-	lcore_main_loop();
-	return 0;
-}
-
-static void
-signal_handler(int signum)
-{
-	if (signum == SIGINT || signum == SIGTERM) {
-		printf("\n\nSignal %d received, preparing to exit...\n",
-				signum);
-		force_quit = true;
-	}
-}
-
-static int
-lcore_rx(struct lcore_params *p)
-{
-	const uint16_t nb_ports = rte_eth_dev_count_avail();
-	const int socket_id = rte_socket_id();
-	uint16_t port;
-	struct rte_mbuf *bufs[BURST_SIZE*2];
-
-	RTE_ETH_FOREACH_DEV(port) {
-		/* skip ports that are not enabled */
-		if ((enabled_port_mask & (1 << port)) == 0)
-			continue;
-
-		if (rte_eth_dev_socket_id(port) > 0 &&
-				rte_eth_dev_socket_id(port) != socket_id)
-			printf("WARNING, port %u is on remote NUMA node to "
-					"RX thread.\n\tPerformance will not "
-					"be optimal.\n", port);
 	}
 
-	printf("\nCore %u doing packet RX.\n", rte_lcore_id());
-	port = 0;
-	while (!quit_signal_rx) {
+	// send to queue
+	nb_tx = rte_ring_enqueue_burst(tx_ring, (void *)reply_buf, cnt, NULL);
 
-		/* skip ports that are not enabled */
-		if ((enabled_port_mask & (1 << port)) == 0) {
-			if (++port == nb_ports)
-				port = 0;
-			continue;
-		}
-		const uint16_t nb_rx = rte_eth_rx_burst(port, 0, bufs,
-				BURST_SIZE);
-		if (unlikely(nb_rx == 0)) {
-			if (++port == nb_ports)
-				port = 0;
-			continue;
-		}
-		app_stats.rx.rx_pkts += nb_rx;
-
-/*
- * You can run the distributor on the rx core with this code. Returned
- * packets are then send straight to the tx core.
- */
-#if 0
-	rte_distributor_process(d, bufs, nb_rx);
-	const uint16_t nb_ret = rte_distributor_returned_pktsd,
-			bufs, BURST_SIZE*2);
-
-		app_stats.rx.returned_pkts += nb_ret;
-		if (unlikely(nb_ret == 0)) {
-			if (++port == nb_ports)
-				port = 0;
-			continue;
-		}
-
-		struct rte_ring *tx_ring = p->dist_tx_ring;
-		uint16_t sent = rte_ring_enqueue_burst(tx_ring,
-				(void *)bufs, nb_ret, NULL);
-#else
-		uint16_t nb_ret = nb_rx;
-		/*
-		 * Swap the following two lines if you want the rx traffic
-		 * to go directly to tx, no distribution.
-		 */
-		struct rte_ring *out_ring = p->rx_dist_ring;
-		/* struct rte_ring *out_ring = p->dist_tx_ring; */
-
-		uint16_t sent = rte_ring_enqueue_burst(out_ring,
-				(void *)bufs, nb_ret, NULL);
-#endif
-
-		app_stats.rx.enqueued_pkts += sent;
-		if (unlikely(sent < nb_ret)) {
-			app_stats.rx.enqdrop_pkts +=  nb_ret - sent;
-			RTE_LOG_DP(DEBUG, DISTRAPP,
-				"%s:Packet loss due to full ring\n", __func__);
-			while (sent < nb_ret)
-				rte_pktmbuf_free(bufs[sent++]);
-		}
-		if (++port == nb_ports)
-			port = 0;
-	}
-	/* set worker & tx threads quit flag */
-	printf("\nCore %u exiting rx task.\n", rte_lcore_id());
-	quit_signal = 1;
-	return 0;
-}
-
-static int
-lcore_distributor(struct lcore_params *p)
-{
-	struct rte_ring *in_r = p->rx_dist_ring;
-	struct rte_ring *out_r = p->dist_tx_ring;
-	struct rte_mbuf *bufs[BURST_SIZE * 4];
-	struct rte_distributor *d = p->d;
-
-	printf("\nCore %u acting as distributor core.\n", rte_lcore_id());
-	while (!quit_signal_dist) {
-		const uint16_t nb_rx = rte_ring_dequeue_burst(in_r,
-				(void *)bufs, BURST_SIZE*1, NULL);
-		if (nb_rx) {
-			app_stats.dist.in_pkts += nb_rx;
-
-			/* Distribute the packets */
-			rte_distributor_process(d, bufs, nb_rx);
-			/* Handle Returns */
-			const uint16_t nb_ret =
-				rte_distributor_returned_pkts(d,
-					bufs, BURST_SIZE*2);
-
-			if (unlikely(nb_ret == 0))
-				continue;
-			app_stats.dist.ret_pkts += nb_ret;
-
-			uint16_t sent = rte_ring_enqueue_burst(out_r,
-					(void *)bufs, nb_ret, NULL);
-			app_stats.dist.sent_pkts += sent;
-			if (unlikely(sent < nb_ret)) {
-				app_stats.dist.enqdrop_pkts += nb_ret - sent;
-				RTE_LOG(DEBUG, DISTRAPP,
-					"%s:Packet loss due to full out ring\n",
-					__func__);
-				while (sent < nb_ret)
-					rte_pktmbuf_free(bufs[sent++]);
-			}
+	// free query buffer and unsend packet.
+	for(int i = 0; i < nb_rx; i++){
+		rte_pktmbuf_free(query_buf[i]);
+		if(nb_tx < nb_rx){
+			for(uint8_t j = nb_tx; j < nb_rx; j++)
+			rte_pktmbuf_free(reply_buf[j]);
 		}
 	}
-	printf("\nCore %u exiting distributor task.\n", rte_lcore_id());
-	quit_signal_work = 1;
 
-	rte_distributor_flush(d);
-	/* Unblock any returns so workers can exit */
-	rte_distributor_clear_returns(d);
-	quit_signal_rx = 1;
-	return 0;
-}
 
-static int
-lcore_worker(struct lcore_params *p)
-{
-	struct rte_distributor *d = p->d;
-	const unsigned id = p->worker_id;
-	unsigned int num = 0;
-	unsigned int i;
-
-	/*
-	 * for single port, xor_val will be zero so we won't modify the output
-	 * port, otherwise we send traffic from 0 to 1, 2 to 3, and vice versa
-	 */
-	const unsigned xor_val = (rte_eth_dev_count_avail() > 1);
-	struct rte_mbuf *buf[8] __rte_cache_aligned;
-
-	for (i = 0; i < 8; i++)
-		buf[i] = NULL;
-
-	app_stats.worker_pkts[p->worker_id] = 1;
-
-	printf("\nCore %u acting as worker core.\n", rte_lcore_id());
-	while (!quit_signal_work) {
-		num = rte_distributor_get_pkt(d, id, buf, buf, num);
-		/* Do a little bit of work for each packet */
-		for (i = 0; i < num; i++) {
-			uint64_t t = rte_rdtsc()+100;
-
-			while (rte_rdtsc() < t)
-				rte_pause();
-			buf[i]->port ^= xor_val;
-		}
-
-		app_stats.worker_pkts[p->worker_id] += num;
-		if (num > 0)
-			app_stats.worker_bursts[p->worker_id][num-1]++;
-	}
 	return 0;
 }
 
@@ -623,55 +451,32 @@ main(int argc, char *argv[])
 		printf("\nWARNING: Too many lcores enabled. Only 1 used.\n");
 
     // 声明两个环形无锁队列用于数据传输
-	rx_dist_ring = rte_ring_create("Input_ring", SCHED_RX_RING_SZ,
+	struct rte_ring *rx_ring = rte_ring_create("Input_ring", SCHED_RX_RING_SZ,
 			rte_socket_id(), RING_F_SC_DEQ | RING_F_SP_ENQ);
-	if (rx_dist_ring == NULL)
+	if (rx_ring == NULL)
 		rte_exit(EXIT_FAILURE, "Cannot create output ring\n");
 
-    dist_tx_ring = rte_ring_create("Output_ring", SCHED_TX_RING_SZ,
+    struct rte_ring *tx_ring = rte_ring_create("Output_ring", SCHED_TX_RING_SZ,
 			rte_socket_id(), RING_F_SC_DEQ | RING_F_SP_ENQ);
-	if (dist_tx_ring == NULL)
+	if (tx_ring == NULL)
 		rte_exit(EXIT_FAILURE, "Cannot create output ring\n");
 
     // 0号lcore运行rx线程
-    struct lcore_params *p = rte_malloc(NULL, sizeof(*p), 0);
-    if (!p)
-        rte_panic("malloc failure\n");
-    *p = (struct lcore_params){rx_dist_ring, dist_tx_ring, mbuf_pool};
-    rte_eal_remote_launch((lcore_function_t *)lcore_rx, p, 0);
+    rte_eal_remote_launch((lcore_function_t *)lcore_rx, rx_ring, 0);
 
-    // 1号运行distributor线程
-    p = rte_malloc(NULL, sizeof(*p), 0);
-    if (!p)
-        rte_panic("malloc failure\n");
-    *p = (struct lcore_params){rx_dist_ring, dist_tx_ring, mbuf_pool};
-    rte_eal_remote_launch((lcore_function_t *)lcore_distributor, p, 1);
-    p = rte_malloc(NULL, sizeof(*p), 0);
+    // 1号到4号lcore运行worker线程
+	struct lcore_params *p;
+	uint8_t i = 1;
+	for(i = 1; i <= 4; i++){
+		p = rte_malloc(NULL, sizeof(*p), 0);
+		if (!p)
+			rte_panic("malloc failure\n");
+		*p = (struct lcore_params){rx_ring, tx_ring, mbuf_pool};
+		rte_eal_remote_launch((lcore_function_t *)lcore_worker, p, i);
+	}
 
-    // 2号到5号lcore运行worker线程
-    p = rte_malloc(NULL, sizeof(*p), 0);
-    if (!p)
-        rte_panic("malloc failure\n");
-    *p = (struct lcore_params){rx_dist_ring, dist_tx_ring, mbuf_pool};
-    rte_eal_remote_launch((lcore_function_t *)lcore_worker, p, 2);
-    p = rte_malloc(NULL, sizeof(*p), 0);
-    if (!p)
-        rte_panic("malloc failure\n");
-    *p = (struct lcore_params){rx_dist_ring, dist_tx_ring, mbuf_pool};
-    rte_eal_remote_launch((lcore_function_t *)lcore_worker, p, 3);
-    p = rte_malloc(NULL, sizeof(*p), 0);
-    if (!p)
-        rte_panic("malloc failure\n");
-    *p = (struct lcore_params){rx_dist_ring, dist_tx_ring, mbuf_pool};
-    rte_eal_remote_launch((lcore_function_t *)lcore_worker, p, 4);
-    p = rte_malloc(NULL, sizeof(*p), 0);
-    if (!p)
-        rte_panic("malloc failure\n");
-    *p = (struct lcore_params){rx_dist_ring, dist_tx_ring, mbuf_pool};
-    rte_eal_remote_launch((lcore_function_t *)lcore_worker, p, 5);
-
-    // 6号lcore运行tx线程
-    rte_eal_remote_launch((lcore_function_t *)lcore_tx, dist_tx_ring, 6);
+    // 5号lcore运行tx线程
+    rte_eal_remote_launch((lcore_function_t *)lcore_tx, tx_ring, 5);
 
     // wait for ending.
 	RTE_LCORE_FOREACH_SLAVE(lcore_id) {
