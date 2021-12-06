@@ -202,6 +202,7 @@ static int
 lcore_rx((struct rte_ring *rx_ring)
 {
 	uint16_t port;
+	uint16_t nb_rx, nb_tx;
 	struct rte_mbuf *bufs[BURST_SIZE];
 
 	/*
@@ -224,13 +225,13 @@ lcore_rx((struct rte_ring *rx_ring)
 		uint16_t nb_rx = rte_eth_rx_burst(port, 0, bufs, BURST_SIZE);
 
 		// 批量enqueue到rx_ring中
-		uint16_t sent = rte_ring_enqueue_burst(rx_ring, (void *)bufs, nb_rx, NULL);
+		uint16_t nb_tx = rte_ring_enqueue_burst(rx_ring, (void *)bufs, nb_rx, NULL);
 
 		// 释放没入队的包
-		if(unlikely(sent < nb_rx)){
-			rx_queue_drop_packets += nb_rx - sent;
-			while(sent < nb_rx){
-				rte_pktmbuf_free(bufs[sent++]);
+		if(unlikely(nb_tx < nb_rx)){
+			rx_queue_drop_packets += nb_rx - nb_tx;
+			while(nb_tx < nb_rx){
+				rte_pktmbuf_free(bufs[nb_tx++]);
 			}
 		}
 	}
@@ -251,7 +252,7 @@ lcore_worker(struct lcore_params *p)
 
 	printf("\nCore %u doing packet processing.\n", rte_lcore_id());
 
-	uint16_t not_sent_to_tx_queue_packets = 0;
+	uint16_t tx_queue_drop_packets = 0;
 
 	while (!force_quit) {
 		// apply reply packet memory
@@ -336,78 +337,44 @@ lcore_worker(struct lcore_params *p)
 		for(i = 0; i < nb_rx; i++)
 			rte_pktmbuf_free(query_buf[i]);
 		for(i = nb_tx; i < nb_tx_prepare; i++){
-			not_sent_to_tx_queue_packets += 1;
+			tx_queue_drop_packets += 1;
 			rte_pktmbuf_free(reply_buf[i]);
 		}
 	}
-	printf("not sent to tx queue packet number: %d\n", not_sent_to_tx_queue_packets);
+	printf("tx queue drop packet number: %d\n", tx_queue_drop_packets);
+
 	return 0;
 }
 
 static int
 lcore_tx(struct rte_ring *in_r)
 {
-	static struct output_buffer tx_buffers[RTE_MAX_ETHPORTS];
-	const int socket_id = rte_socket_id();
-	uint16_t port;
-
-	RTE_ETH_FOREACH_DEV(port) {
-		/* skip ports that are not enabled */
-		if ((enabled_port_mask & (1 << port)) == 0)
-			continue;
-
-		if (rte_eth_dev_socket_id(port) > 0 &&
-				rte_eth_dev_socket_id(port) != socket_id)
-			printf("WARNING, port %u is on remote NUMA node to "
-					"TX thread.\n\tPerformance will not "
-					"be optimal.\n", port);
-	}
+	uint16_t port = 0;
+	uint16_t i;
+	uint16_t nb_rx, nb_tx;
+	struct rte_mbuf *bufs[BURST_SIZE];
 
 	printf("\nCore %u doing packet TX.\n", rte_lcore_id());
-	while (!quit_signal) {
 
-		RTE_ETH_FOREACH_DEV(port) {
-			/* skip ports that are not enabled */
-			if ((enabled_port_mask & (1 << port)) == 0)
-				continue;
+	uint16_t dpdk_send_ring_drop_packets = 0;
+	while (!force_quit) {
+		// dequeue data
+		nb_rx = rte_ring_dequeue_burst(tx_ring, (void *)buf, BURST_SIZE, NULL);
 
-			struct rte_mbuf *bufs[BURST_SIZE_TX];
-			const uint16_t nb_rx = rte_ring_dequeue_burst(in_r,
-					(void *)bufs, BURST_SIZE_TX, NULL);
-			app_stats.tx.dequeue_pkts += nb_rx;
+		// tx
+		nb_tx = rte_eth_tx_burst(port, 0, buf, nb_rx);
 
-			/* if we get no traffic, flush anything we have */
-			if (unlikely(nb_rx == 0)) {
-				flush_all_ports(tx_buffers);
-				continue;
-			}
-
-			/* for traffic we receive, queue it up for transmit */
-			uint16_t i;
-			rte_prefetch_non_temporal((void *)bufs[0]);
-			rte_prefetch_non_temporal((void *)bufs[1]);
-			rte_prefetch_non_temporal((void *)bufs[2]);
-			for (i = 0; i < nb_rx; i++) {
-				struct output_buffer *outbuf;
-				uint8_t outp;
-				rte_prefetch_non_temporal((void *)bufs[i + 3]);
-				/*
-				 * workers should update in_port to hold the
-				 * output port value
-				 */
-				outp = bufs[i]->port;
-				/* skip ports that are not enabled */
-				if ((enabled_port_mask & (1 << outp)) == 0)
-					continue;
-
-				outbuf = &tx_buffers[outp];
-				outbuf->mbufs[outbuf->count++] = bufs[i];
-				if (outbuf->count == BURST_SIZE_TX)
-					flush_one_port(outbuf, outp);
+		// free unsent memory
+		if(unlikely(nb_tx < nb_rx)){
+			dpdk_send_ring_drop_packets += nb_rx - nb_tx;
+			while(nb_tx < nb_rx){
+				rte_pktmbuf_free(bufs[nb_tx++]);
 			}
 		}
 	}
-	printf("\nCore %u exiting tx task.\n", rte_lcore_id());
+
+	printf("dpdk send ring drop packet numbers: %d\n", dpdk_send_ring_drop_packets);
+
 	return 0;
 }
 
@@ -480,6 +447,9 @@ main(int argc, char *argv[])
 		if (rte_eal_wait_lcore(lcore_id) < 0)
 			return -1;
 	}
+
+	// free memory
+		/* waiting for filling.*/
 
 	return 0;
 }
