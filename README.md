@@ -39,7 +39,7 @@
 ``` C
 retval = rte_eth_dev_configure(port, rx_rings, tx_rings, &port_conf);
 ```
-> rx_rings为接收队列个数，tx_rings为发送队列个数，在这里可以直接设置每个port（网卡）的队列数量，至于网卡如何将接收到的网络包划分到多个队列，就需要对port_conf进行配置，具体的配置说明会在s实现细节的第三条（流分类）里面详细去说。
+> rx_rings为接收队列个数，tx_rings为发送队列个数，在这里可以直接设置每个port（网卡）的队列数量，至于网卡如何将接收到的网络包划分到多个队列，就需要对port_conf进行配置，具体的配置说明会在实现细节的第三条（流分类）里面详细去说。
 ``` C
 retval = rte_eth_dev_adjust_nb_rx_tx_desc(port, &nb_rxd, &nb_txd);
 ```
@@ -190,17 +190,17 @@ struct rte_eth_conf port_conf = {
 ```
 > rte_ring_dequeue_burst将队列中的数据按照BURST_SIZE批量出队，实际出队数量为nb_rx。
 
-![pipeline结构图](https://github.com/xinhaixiangyunpiao/MarkDown_Image_Repository/blob/master/3.png?raw=true)
-- 这里没有进行详细的Profile，仅按照功能进行简单的划分，划分了六个线程，每个线程分配给一个lcore：
+![pipeline结构图](https://github.com/xinhaixiangyunpiao/MarkDown_Image_Repository/blob/master/4.png?raw=true)
+- 这里没有进行详细的Profile，仅按照功能进行简单的划分，划分了三个线程，每个线程分配给一个lcore：
     1. 1个rx线程：
         - 从port批量接收数据，将接收到的数据包批量入队到rx_ring中。
-    2. 4个处理线程：
-        - 每个处理线程从rx_ring取出数据包，每个worker一次都会取n个，处理完了将结果放在tx_ring中。
+    2. 1个处理线程：
+        - 处理线程从rx_ring取出数据包，每个worker一次都会取n个，处理完了将结果放在tx_ring中。
     3. 1个tx线程：
         - 从tx_ring批量取出数据包，并批量发送出去。
-- 线程同步：线程之间通过lcore_params传递无锁队列，利用无锁队列传递数据，具体参考代码。
+- 线程通信：线程之间通过lcore_params传递无锁队列，利用无锁队列传递数据，具体参考代码。
 - 最终的实现效果为：三个线程并行运行（接收线程，处理线程，发送线程）。
-- 这里认为任务瓶颈在DPDK-DNS数据包处理，所以安排了1个接收线程，1个发送线程，4个处理线程，不同的线程数量比例可能会造成瓶颈转移，需要在实践中进行调试。
+- 此处安排了1个接收线程，1个发送线程，1个处理线程，可以在数据包比较多的时候看瓶颈在哪个线程，对瓶颈进行并行处理（开多个线程，这时候就要注意这些并行的线程是否需要加锁，不加锁可能会造成段错误。）
 
 # 关于测试方式和评价标准
 - 测试方式：使用pktgen在node6上进行发包，一次发送n个包，在node5运行DPDK-DNS-PARALLEL程序进行处理，多次实验后输出平均处理结果。

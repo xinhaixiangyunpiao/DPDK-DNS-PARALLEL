@@ -36,13 +36,7 @@ static volatile bool force_quit;
 
 static const struct rte_eth_conf port_conf_default = {
 	.rxmode = {
-		.mq_mode = ETH_MQ_RX_RSS,
-	},
-	.rx_adv_conf = {
-		.rss_conf = {
-			.rss_key = NULL,
-			.rss_hf = ETH_RSS_NONFRAG_IPV4_UDP,
-		},
+		.max_rx_pkt_len = ETHER_MAX_LEN,
 	},
 };
 struct rte_mempool *mbuf_pool;
@@ -198,8 +192,13 @@ signal_handler(int signum)
 	}
 }
 
+struct lcore_params {
+	struct rte_ring *rx_ring;
+	struct rte_ring *tx_ring;
+};
+
 static int
-lcore_rx((struct rte_ring *rx_ring)
+lcore_rx(struct rte_ring *rx_ring)
 {
 	uint16_t port;
 	uint16_t nb_rx, nb_tx;
@@ -222,10 +221,10 @@ lcore_rx((struct rte_ring *rx_ring)
 	uint32_t rx_queue_drop_packets = 0;
 	while (!force_quit){
 		// 从port接收包
-		uint16_t nb_rx = rte_eth_rx_burst(port, 0, bufs, BURST_SIZE);
+		nb_rx = rte_eth_rx_burst(port, 0, bufs, BURST_SIZE);
 
 		// 批量enqueue到rx_ring中
-		uint16_t nb_tx = rte_ring_enqueue_burst(rx_ring, (void *)bufs, nb_rx, NULL);
+		nb_tx = rte_ring_enqueue_burst(rx_ring, (void *)bufs, nb_rx, NULL);
 
 		// 释放没入队的包
 		if(unlikely(nb_tx < nb_rx)){
@@ -246,9 +245,11 @@ lcore_worker(struct lcore_params *p)
 	uint16_t nb_rx, nb_tx;
 	uint16_t i = 0;
 	struct rte_mbuf *query_buf[PROCESS_SIZE], *reply_buf[PROCESS_SIZE];
-	struct rte_ring* rx_ring = p->rx_ring;
-	struct rte_ring* tx_ring = p->tx_ring;
-	struct rte_mempool *mbuf_pool = p->mbuf_pool;
+	struct rte_ring *in_ring = p->rx_ring;
+	struct rte_ring *out_ring = p->tx_ring;
+	uint8_t *buffer;
+	struct Message msg;
+	memset(&msg, 0, sizeof(struct Message));
 
 	printf("\nCore %u doing packet processing.\n", rte_lcore_id());
 
@@ -263,7 +264,7 @@ lcore_worker(struct lcore_params *p)
 		}
 
 		// dequeue 4 packet
-		nb_rx = rte_ring_dequeue_burst(rx_ring, (void *)query_buf, PROCESS_SIZE, NULL);
+		nb_rx = rte_ring_dequeue_burst(in_ring, (void *)query_buf, PROCESS_SIZE, NULL);
 
 		if (unlikely(nb_rx == 0)){
 			for(i = 0; i < PROCESS_SIZE; i++)
@@ -331,7 +332,7 @@ lcore_worker(struct lcore_params *p)
 		}
 
 		// send to queue
-		nb_tx = rte_ring_enqueue_burst(tx_ring, (void *)reply_buf, nb_tx_prepare, NULL);
+		nb_tx = rte_ring_enqueue_burst(out_ring, (void *)reply_buf, nb_tx_prepare, NULL);
 
 		// free query buffer and unsend packet.
 		for(i = 0; i < nb_rx; i++)
@@ -341,28 +342,30 @@ lcore_worker(struct lcore_params *p)
 			rte_pktmbuf_free(reply_buf[i]);
 		}
 	}
-	printf("tx queue drop packet number: %d\n", tx_queue_drop_packets);
+	
+	printf("core %d: tx queue drop packet number: %d\n", rte_lcore_id(), tx_queue_drop_packets);
 
 	return 0;
 }
 
 static int
-lcore_tx(struct rte_ring *in_r)
+lcore_tx(struct rte_ring *tx_ring)
 {
 	uint16_t port = 0;
-	uint16_t i;
 	uint16_t nb_rx, nb_tx;
 	struct rte_mbuf *bufs[BURST_SIZE];
 
 	printf("\nCore %u doing packet TX.\n", rte_lcore_id());
 
 	uint16_t dpdk_send_ring_drop_packets = 0;
+	uint16_t total_sent = 0;
 	while (!force_quit) {
 		// dequeue data
-		nb_rx = rte_ring_dequeue_burst(tx_ring, (void *)buf, BURST_SIZE, NULL);
+		nb_rx = rte_ring_dequeue_burst(tx_ring, (void *)bufs, BURST_SIZE, NULL);
 
 		// tx
-		nb_tx = rte_eth_tx_burst(port, 0, buf, nb_rx);
+		nb_tx = rte_eth_tx_burst(port, 0, bufs, nb_rx);
+		total_sent += nb_tx;
 
 		// free unsent memory
 		if(unlikely(nb_tx < nb_rx)){
@@ -373,7 +376,7 @@ lcore_tx(struct rte_ring *in_r)
 		}
 	}
 
-	printf("dpdk send ring drop packet numbers: %d\n", dpdk_send_ring_drop_packets);
+	printf("dpdk send ring drop packet numbers: %d, total sent number: %d\n", dpdk_send_ring_drop_packets, total_sent);
 
 	return 0;
 }
@@ -411,9 +414,6 @@ main(int argc, char *argv[])
 	if (port_init(portid, mbuf_pool) != 0)
 		rte_exit(EXIT_FAILURE, "Cannot init port %"PRIu16 "\n", portid);
 
-	if (rte_lcore_count() > 1)
-		printf("\nWARNING: Too many lcores enabled. Only 1 used.\n");
-
     // 声明两个环形无锁队列用于数据传输
 	struct rte_ring *rx_ring = rte_ring_create("Input_ring", SCHED_RX_RING_SZ,
 			rte_socket_id(), RING_F_SC_DEQ | RING_F_SP_ENQ);
@@ -426,27 +426,20 @@ main(int argc, char *argv[])
 		rte_exit(EXIT_FAILURE, "Cannot create output ring\n");
 
     // 0号lcore运行rx线程
-    rte_eal_remote_launch((lcore_function_t *)lcore_rx, rx_ring, 0);
-
-    // 1号到4号lcore运行worker线程
-	struct lcore_params *p;
-	uint8_t i = 1;
-	for(i = 1; i <= 4; i++){
-		p = rte_malloc(NULL, sizeof(*p), 0);
-		if (!p)
-			rte_panic("malloc failure\n");
-		*p = (struct lcore_params){rx_ring, tx_ring, mbuf_pool};
-		rte_eal_remote_launch((lcore_function_t *)lcore_worker, p, i);
+	struct lcore_params p;
+	p.rx_ring = rx_ring;
+	p.tx_ring = tx_ring;
+	RTE_LCORE_FOREACH_SLAVE(lcore_id) {
+		if(lcore_id == 1)
+			rte_eal_remote_launch((lcore_function_t*)lcore_tx, (void*)tx_ring, lcore_id);
+		else
+			rte_eal_remote_launch((lcore_function_t*)lcore_worker, (void*)&p, lcore_id);
 	}
-
-    // 5号lcore运行tx线程
-    rte_eal_remote_launch((lcore_function_t *)lcore_tx, tx_ring, 5);
+	// 0 lcore do RX. 
+	lcore_rx(rx_ring);
 
     // wait for ending.
-	RTE_LCORE_FOREACH_SLAVE(lcore_id) {
-		if (rte_eal_wait_lcore(lcore_id) < 0)
-			return -1;
-	}
+	rte_eal_mp_wait_lcore();
 
 	// free memory
 		/* waiting for filling.*/
