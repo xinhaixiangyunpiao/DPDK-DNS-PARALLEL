@@ -243,6 +243,7 @@ static int
 lcore_worker(struct lcore_params *p)
 {
 	uint16_t nb_rx, nb_tx;
+	uint16_t i = 0;
 	struct rte_mbuf *query_buf[PROCESS_SIZE], *reply_buf[PROCESS_SIZE];
 	struct rte_ring* rx_ring = p->rx_ring;
 	struct rte_ring* tx_ring = p->tx_ring;
@@ -250,9 +251,11 @@ lcore_worker(struct lcore_params *p)
 
 	printf("\nCore %u doing packet processing.\n", rte_lcore_id());
 
+	uint16_t not_sent_to_tx_queue_packets = 0;
+
 	while (!force_quit) {
 		// apply reply packet memory
-		for(int i = 0; i < PROCESS_SIZE; i++){
+		for(i = 0; i < PROCESS_SIZE; i++){
 			do{
 				reply_buf[i] = rte_pktmbuf_alloc(mbuf_pool);
 			}while(reply_buf[i] == NULL);
@@ -262,14 +265,13 @@ lcore_worker(struct lcore_params *p)
 		nb_rx = rte_ring_dequeue_burst(rx_ring, (void *)query_buf, PROCESS_SIZE, NULL);
 
 		if (unlikely(nb_rx == 0)){
-			for(int i = 0; i < PROCESS_SIZE; i++)
+			for(i = 0; i < PROCESS_SIZE; i++)
 				rte_pktmbuf_free(reply_buf[i]);
 			continue;
 		}
 
-		int cnt = 0;
-		for(int i = 0; i < nb_rx; i++){
-
+		uint16_t nb_tx_prepare = 0;
+		for(i = 0; i < nb_rx; i++){
             free_questions(msg.questions);
             free_resource_records(msg.answers);
             free_resource_records(msg.authorities);
@@ -278,7 +280,6 @@ lcore_worker(struct lcore_params *p)
 
 			// filter the port 9000 not 9000
 			if(*rte_pktmbuf_mtod_offset(query_buf[i], uint16_t*, 36) != rte_cpu_to_be_16(9000)){
-				rte_pktmbuf_free(query_buf[i]);
 				continue;
 			}
 
@@ -288,7 +289,6 @@ lcore_worker(struct lcore_params *p)
 			/*********read input (begin)**********/ 
 			// not DNS
 			if (decode_msg(&msg, buffer, query_buf[i]->data_len - 42) != 0) {
-				rte_pktmbuf_free(query_buf[i]);
 				continue;
 			}
 			/* Print query */
@@ -304,14 +304,13 @@ lcore_worker(struct lcore_params *p)
 
 			// plan the reply packet space.
 			// add ethernet header, ipv4 header, udp header
-			rte_pktmbuf_append(reply_buf[cnt], sizeof(struct ether_hdr));
-			rte_pktmbuf_append(reply_buf[cnt], sizeof(struct ipv4_hdr));
-			rte_pktmbuf_append(reply_buf[cnt], sizeof(struct udp_hdr));
+			rte_pktmbuf_append(reply_buf[nb_tx_prepare], sizeof(struct ether_hdr));
+			rte_pktmbuf_append(reply_buf[nb_tx_prepare], sizeof(struct ipv4_hdr));
+			rte_pktmbuf_append(reply_buf[nb_tx_prepare], sizeof(struct udp_hdr));
 			
 			/*********write output (begin)**********/
 			uint8_t *p = buffer;
 			if (encode_msg(&msg, &p) != 0) {
-				rte_pktmbuf_free(query_buf[i]);
 				continue;
 			}
 
@@ -322,28 +321,26 @@ lcore_worker(struct lcore_params *p)
 			//Part 3.
 
 			// add the payload
-			char * payload = (char*)rte_pktmbuf_append(reply_buf[cnt], buflen);
+			char * payload = (char*)rte_pktmbuf_append(reply_buf[nb_tx_prepare], buflen);
 			rte_memcpy(payload, buffer, buflen);
 			
 			// acording to query_buf, build DPDK packet head
-			build_packet(rte_pktmbuf_mtod_offset(query_buf[i], char*, 0), rte_pktmbuf_mtod_offset(reply_buf[cnt], char*, 0), buflen);
-			cnt++;
+			build_packet(rte_pktmbuf_mtod_offset(query_buf[i], char*, 0), rte_pktmbuf_mtod_offset(reply_buf[nb_tx_prepare], char*, 0), buflen);
+			nb_tx_prepare++;
+		}
+
+		// send to queue
+		nb_tx = rte_ring_enqueue_burst(tx_ring, (void *)reply_buf, nb_tx_prepare, NULL);
+
+		// free query buffer and unsend packet.
+		for(i = 0; i < nb_rx; i++)
+			rte_pktmbuf_free(query_buf[i]);
+		for(i = nb_tx; i < nb_tx_prepare; i++){
+			not_sent_to_tx_queue_packets += 1;
+			rte_pktmbuf_free(reply_buf[i]);
 		}
 	}
-
-	// send to queue
-	nb_tx = rte_ring_enqueue_burst(tx_ring, (void *)reply_buf, cnt, NULL);
-
-	// free query buffer and unsend packet.
-	for(int i = 0; i < nb_rx; i++){
-		rte_pktmbuf_free(query_buf[i]);
-		if(nb_tx < nb_rx){
-			for(uint8_t j = nb_tx; j < nb_rx; j++)
-			rte_pktmbuf_free(reply_buf[j]);
-		}
-	}
-
-
+	printf("not sent to tx queue packet number: %d\n", not_sent_to_tx_queue_packets);
 	return 0;
 }
 

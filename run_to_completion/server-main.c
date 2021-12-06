@@ -195,6 +195,7 @@ static void
 lcore_main_loop(void)
 {
 	uint16_t port = 0;	        // only one port is used.
+	uint16_t i = 0, j = 0;
     unsigned lcore_id;
 	struct rte_mbuf *query_buf[BURST_SIZE], *reply_buf[BURST_SIZE];
 	uint16_t nb_rx, nb_tx;
@@ -225,7 +226,7 @@ lcore_main_loop(void)
 		// Part 0. 
 
 		// ask for reply packet memory
-		for(int i = 0; i < BURST_SIZE; i++){
+		for(i = 0; i < BURST_SIZE; i++){
 			do{
 				reply_buf[i] = rte_pktmbuf_alloc(mbuf_pool);
 			}while(reply_buf[i] == NULL);
@@ -240,14 +241,13 @@ lcore_main_loop(void)
 		nb_rx = rte_eth_rx_burst(port, lcore_id, query_buf, BURST_SIZE);
 
 		if (unlikely(nb_rx == 0)){
-			for(int i = 0; i < BURST_SIZE; i++)
+			for(i = 0; i < BURST_SIZE; i++)
 				rte_pktmbuf_free(reply_buf[i]);
 			continue;
 		}
 		
-		int cnt = 0;
-		for(int i = 0; i < nb_rx; i++){
-
+		uint16_t nb_tx_prepare = 0;
+		for(i = 0; i < nb_rx; i++){
             free_questions(msg.questions);
             free_resource_records(msg.answers);
             free_resource_records(msg.authorities);
@@ -256,7 +256,6 @@ lcore_main_loop(void)
 
 			// filter the port 9000 not 9000
 			if(*rte_pktmbuf_mtod_offset(query_buf[i], uint16_t*, 36) != rte_cpu_to_be_16(9000)){
-				rte_pktmbuf_free(query_buf[i]);
 				continue;
 			}
 
@@ -266,7 +265,6 @@ lcore_main_loop(void)
 			/*********read input (begin)**********/ 
 			// not DNS
 			if (decode_msg(&msg, buffer, query_buf[i]->data_len - 42) != 0) {
-				rte_pktmbuf_free(query_buf[i]);
 				continue;
 			}
 			/* Print query */
@@ -282,14 +280,13 @@ lcore_main_loop(void)
 
 			// plan the reply packet space.
 			// add ethernet header, ipv4 header, udp header
-			rte_pktmbuf_append(reply_buf[cnt], sizeof(struct ether_hdr));
-			rte_pktmbuf_append(reply_buf[cnt], sizeof(struct ipv4_hdr));
-			rte_pktmbuf_append(reply_buf[cnt], sizeof(struct udp_hdr));
+			rte_pktmbuf_append(reply_buf[nb_tx_prepare], sizeof(struct ether_hdr));
+			rte_pktmbuf_append(reply_buf[nb_tx_prepare], sizeof(struct ipv4_hdr));
+			rte_pktmbuf_append(reply_buf[nb_tx_prepare], sizeof(struct udp_hdr));
 			
 			/*********write output (begin)**********/
 			uint8_t *p = buffer;
 			if (encode_msg(&msg, &p) != 0) {
-				rte_pktmbuf_free(query_buf[i]);
 				continue;
 			}
 
@@ -300,28 +297,25 @@ lcore_main_loop(void)
 			//Part 3.
 
 			// add the payload
-			char * payload = (char*)rte_pktmbuf_append(reply_buf[cnt], buflen);
+			char * payload = (char*)rte_pktmbuf_append(reply_buf[nb_tx_prepare], buflen);
 			rte_memcpy(payload, buffer, buflen);
 			
 			// acording to query_buf, build DPDK packet head
-			build_packet(rte_pktmbuf_mtod_offset(query_buf[i], char*, 0), rte_pktmbuf_mtod_offset(reply_buf[cnt], char*, 0), buflen);
-			cnt++;
+			build_packet(rte_pktmbuf_mtod_offset(query_buf[i], char*, 0), rte_pktmbuf_mtod_offset(reply_buf[nb_tx_prepare], char*, 0), buflen);
+			nb_tx_prepare++;
 		}
-		nb_rx = cnt;
 
         // send packet. 0号核发送到0号queue，1号核发送到1号queue
-		nb_tx = rte_eth_tx_burst(port, lcore_id, reply_buf, nb_rx);
+		nb_tx = rte_eth_tx_burst(port, lcore_id, reply_buf, nb_tx_prepare);
 
-        total_rx += nb_rx;
+        total_rx += nb_tx_prepare;
         total_tx += nb_tx;
         
 		// free query buffer and unsend packet.
-		for(int i = 0; i < nb_rx; i++){
+		for(i = 0; i < nb_rx; i++)
 			rte_pktmbuf_free(query_buf[i]);
-			if(nb_tx < nb_rx){
-				for(uint8_t j = nb_tx; j < nb_rx; j++)
-				rte_pktmbuf_free(reply_buf[j]);
-			}
+		for(i = nb_tx; i < nb_tx_prepare; i++){
+			rte_pktmbuf_free(reply_buf[i]);
 		}
 	}
     
