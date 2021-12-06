@@ -256,6 +256,7 @@ lcore_main_loop(void)
 
 			// filter the port 9000 not 9000
 			if(*rte_pktmbuf_mtod_offset(query_buf[i], uint16_t*, 36) != rte_cpu_to_be_16(9000)){
+				rte_pktmbuf_free(query_buf[i]);
 				continue;
 			}
 
@@ -265,6 +266,7 @@ lcore_main_loop(void)
 			/*********read input (begin)**********/ 
 			// not DNS
 			if (decode_msg(&msg, buffer, query_buf[i]->data_len - 42) != 0) {
+				rte_pktmbuf_free(query_buf[i]);
 				continue;
 			}
 			/* Print query */
@@ -287,6 +289,7 @@ lcore_main_loop(void)
 			/*********write output (begin)**********/
 			uint8_t *p = buffer;
 			if (encode_msg(&msg, &p) != 0) {
+				rte_pktmbuf_free(query_buf[i]);
 				continue;
 			}
 
@@ -304,10 +307,11 @@ lcore_main_loop(void)
 			build_packet(rte_pktmbuf_mtod_offset(query_buf[i], char*, 0), rte_pktmbuf_mtod_offset(reply_buf[cnt], char*, 0), buflen);
 			cnt++;
 		}
-		
+		nb_rx = cnt;
+
         // send packet. 0号核发送到0号queue，1号核发送到1号queue
-		nb_tx = rte_eth_tx_burst(port, lcore_id, reply_buf, cnt);
-	   
+		nb_tx = rte_eth_tx_burst(port, lcore_id, reply_buf, nb_rx);
+
         total_rx += nb_rx;
         total_tx += nb_tx;
         
