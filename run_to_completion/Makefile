@@ -19,7 +19,7 @@ static: build/$(APP)-static
 	ln -sf $(APP)-static build/$(APP)
 
 PC_FILE := $(shell pkg-config --path libdpdk)
-CFLAGS += -O3 $(shell pkg-config --cflags libdpdk)
+CFLAGS += -O3 -std=c99 $(shell pkg-config --cflags libdpdk)
 LDFLAGS_SHARED = $(shell pkg-config --libs libdpdk)
 LDFLAGS_STATIC = -Wl,-Bstatic $(shell pkg-config --static --libs libdpdk)
 
@@ -56,7 +56,7 @@ ifeq ($(CONFIG_RTE_TOOLCHAIN_GCC),y)
 CFLAGS_main.o += -Wno-return-type
 endif
 
-EXTRA_CFLAGS += -O3 -g -Wfatal-errors
+EXTRA_CFLAGS += -O3 -g -Wfatal-errors -std=c99
 
 include $(RTE_SDK)/mk/rte.extapp.mk
 endif
