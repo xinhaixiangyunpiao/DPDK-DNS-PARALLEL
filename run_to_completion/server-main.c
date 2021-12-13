@@ -21,8 +21,6 @@
 
 #include "SimpleDNS.h"
 
-static volatile bool force_quit;
-
 #define RX_RING_SIZE 4096
 #define TX_RING_SIZE 4096
 
@@ -30,7 +28,9 @@ static volatile bool force_quit;
 #define MBUF_CACHE_SIZE 250
 #define BURST_SIZE 32
 
-#define NUM_QUEUES 4
+#define NUM_QUEUES 7
+
+unsigned total_rx[NUM_QUEUES] = {0}, total_tx[NUM_QUEUES] = {0};
 
 static const struct rte_eth_conf port_conf_default = {
 	.rxmode = {
@@ -195,7 +195,7 @@ static void
 lcore_main_loop(void)
 {
 	uint16_t port = 0;	        // only one port is used.
-	uint16_t i = 0, j = 0;
+	uint16_t i = 0;
     unsigned lcore_id;
 	struct rte_mbuf *query_buf[BURST_SIZE], *reply_buf[BURST_SIZE];
 	uint16_t nb_rx, nb_tx;
@@ -218,10 +218,8 @@ lcore_main_loop(void)
 	
 	printf("\nSimpleDNS (using DPDK) is running...\n");
 
-    int total_rx = 0;
-    int total_tx = 0;
 	/* Run until the application is quit or killed. */
-	while (!force_quit) {
+	while (true) {
 		// Add your code here.
 		// Part 0. 
 
@@ -308,8 +306,8 @@ lcore_main_loop(void)
         // send packet. 0号核发送到0号queue，1号核发送到1号queue
 		nb_tx = rte_eth_tx_burst(port, lcore_id, reply_buf, nb_tx_prepare);
 
-        total_rx += nb_tx_prepare;
-        total_tx += nb_tx;
+        total_rx[lcore_id] += nb_tx_prepare;
+        total_tx[lcore_id] += nb_tx;
         
 		// free query buffer and unsend packet.
 		for(i = 0; i < nb_rx; i++)
@@ -318,9 +316,6 @@ lcore_main_loop(void)
 			rte_pktmbuf_free(reply_buf[i]);
 		}
 	}
-    
-    // printf result
-    printf("core id: %d nb_rx:%d, nb_tx:%d\n", lcore_id, total_rx, total_tx); 
 }
 
 static int
@@ -334,9 +329,14 @@ static void
 signal_handler(int signum)
 {
 	if (signum == SIGINT || signum == SIGTERM) {
-		printf("\n\nSignal %d received, preparing to exit...\n",
-				signum);
-		force_quit = true;
+		unsigned rx_sum = 0, tx_sum = 0;
+		printf("signal received, quitting\n");
+		for (int i = 0; i < NUM_QUEUES; i++) {
+    		printf("core id: %d nb_rx:%d, nb_tx:%d\n", i, total_rx[i], total_tx[i]);
+			rx_sum += total_rx[i], tx_sum += total_tx[i];
+		}
+		printf("sum up: nb_rx: %d, nb_tx: %d\n", rx_sum, tx_sum);
+		exit(0);
 	}
 }
 
@@ -358,7 +358,6 @@ main(int argc, char *argv[])
 	argc -= ret;
 	argv += ret;
 
-    force_quit = false;
     signal(SIGINT, signal_handler);
 	signal(SIGTERM, signal_handler);
 
